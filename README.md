@@ -21,8 +21,8 @@
 ## Quick start
 
 ```sh
-curl -fsSL https://yeet.cx | sh                      # install yeet, once
-yeet run gh:yeet-src/sandbox-watch -- claude         # launch the agent and watch it
+curl -fsSL https://yeet.cx | sh                                   # install yeet, once
+yeet run gh:yeet-src/sandbox-watch --tty -- --pid $(pgrep -n claude)   # watch a running agent
 ```
 
 A coding agent's sandbox unshares the network namespace for each command it confines. Both Claude Code and Codex do this: Claude Code wraps each command with `bubblewrap`, and Codex does the same through its `codex-linux-sandbox` helper, which is also `bubblewrap` plus a seccomp filter. `sandbox-watch` stamps every command the agent runs with the net namespace it ran in and compares that to the agent's own: a command whose namespace differs ran inside the sandbox, one whose namespace matches ran outside it, in the agent's own namespace, where a credential path and the network are not walled off. A second probe on the file-open path upgrades the outside case to a kernel fact when a credential read landed on the real file. The comparison is agent-agnostic (it keys on the namespace, not the agent's name); Claude Code and Codex are the two verified today.
@@ -60,24 +60,30 @@ Agents that confine without a per-command network namespace (a pure-Landlock or 
 ```sh
 curl -fsSL https://yeet.cx | sh
 make               # compile bin/probe.bpf.o + bundle the JS (toolchain auto-fetched)
-yeet run .         # unscoped: seeds the host and waits for a --pid or a launch
+yeet run . --tty   # unscoped: seeds the host and waits for a --pid or a launch
 ```
 [Manual install guide](https://yeet.cx/docs/install/manual-installation?utm_source=github&utm_medium=readme&utm_campaign=sandbox-watch) | Linux only
 
 That is the whole install. `yeet run` clones the repo into its own cache, runs `make` to compile `bin/probe.bpf.o` and bundle the JS, then starts the script; the BPF toolchain is fetched automatically, so there is no clang, bpftool or `linux-tools` to install first. `yeet-src` is a trusted source for the runtime, so the build runs without a consent prompt.
 
-A sandbox sets itself up in the agent's first few commands (the `bwrap` wrapper, the `socat` proxy, the stand-in mounts), so there are three ways to scope the watch, and launch mode is the one to reach for:
+There are two ways to scope the watch. Attach mode is one line against a running agent; launch mode starts the agent under the probe so the tree is complete from its first command.
 
 ```sh
-yeet run gh:yeet-src/sandbox-watch -- claude                      # launch mode: start the agent, watch from its first command
-yeet run gh:yeet-src/sandbox-watch -- codex                       # same, for Codex
-yeet run gh:yeet-src/sandbox-watch -- --pid $(pgrep -n claude)    # attach mode: a running agent's pid subtree
-yeet run gh:yeet-src/sandbox-watch -- --container my-agent        # attach to a running container
+yeet run gh:yeet-src/sandbox-watch --tty -- --pid $(pgrep -n claude)   # attach to a running agent's pid subtree
+yeet run gh:yeet-src/sandbox-watch --tty -- --container my-agent       # attach to a running container
 ```
 
-Launch mode starts the agent stopped, hands its pid to the probe, waits for the probe to attach, then lets it run, so there is no window in which the agent forks unobserved and the sandbox setup itself is captured. The `--` matters: flags after it go to the script, flags before it (`--tty`, `--watch`) go to `yeet run`. This is the most common first-run mistake.
+`--tty` goes before the `--` because it belongs to `yeet run` (it gives the script a terminal to draw in; without it the TUI has nothing to paint), and the script's own flags go after. Getting that split wrong is the most common first-run mistake.
 
 Attach mode sees the agent and everything it starts from the moment it attaches, plus the children that already existed when it attached (it seeds them from the process table). What it cannot see is a command that exited before it got there.
+
+Launch mode closes that gap: it starts the agent stopped, attaches, then releases it, so nothing forks unobserved and the sandbox setup itself is captured. It needs the `bin/sandbox-watch` wrapper, because a yeet isolate cannot spawn a process, so clone the repo to use it:
+
+```sh
+git clone https://github.com/yeet-src/sandbox-watch && cd sandbox-watch && make
+./bin/sandbox-watch -- claude      # start claude under the probe, tree complete from byte 0
+./bin/sandbox-watch -- codex       # same, for Codex
+```
 
 It runs until `q` or `Ctrl-C`, reflows on resize, and needs a real terminal, so do not pipe or redirect it. For the text form an agent or a CI job can read, see [Reading it without a TTY](#reading-it-without-a-tty).
 
@@ -85,7 +91,7 @@ It runs until `q` or `Ctrl-C`, reflows on resize, and needs a real terminal, so 
 | --- | --- | --- |
 | `--pid=<n>` | unscoped | attach to a running agent and watch its process subtree |
 | `--container=<name\|id>` | unscoped | scope to a running container; a wrong name lists what is running |
-| (launch) `-- <cmd …>` | none | start `<cmd>` stopped, attach, then release it: the complete tree |
+| `bin/sandbox-watch -- <cmd …>` | none | launch mode (the wrapper): start `<cmd>` stopped, attach, then release it for the complete tree |
 
 With no scope it seeds the whole host and says so, because judging a sandbox needs one agent to compare against; it will tell you to pass `--pid` or launch with `--`.
 
@@ -106,7 +112,7 @@ Set up sandbox-watch from https://github.com/yeet-src/sandbox-watch on this mach
 4. Confirm it actually watches something, not just that it built. In one
    terminal, start a throwaway shell that reaches for a credential path, e.g.
    `bash -c 'sleep 2; ls -la ~/.ssh'`, note its pid, and run
-   `yeet run . -- --pid <that-pid>`. A row for `ls` should appear under
+   `yeet run . --tty -- --pid <that-pid>`. A row for `ls` should appear under
    "every command it ran".
 5. Then run the headless check: `yeet run src/probes/capture.js -- <pid> 10`
    and confirm it prints a verdict block and exits.
@@ -271,7 +277,7 @@ You do not need a real coding agent to see a verdict. Any process that reaches f
 bash -c 'sleep 2; ls -la ~/.ssh; ssh -T -o BatchMode=yes git@github.com'
 
 # terminal 2: watch it (use the pid printed by the shell above)
-yeet run . -- --pid <that-pid>
+yeet run . --tty -- --pid <that-pid>
 ```
 
 The verdict logic is pure JS over the exec stream, which is why it can be tested against a recorded stream with no kernel at all; see `test/sandbox.test.mjs`.
