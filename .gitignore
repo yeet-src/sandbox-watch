@@ -1,0 +1,14 @@
+# build artifacts
+/node_modules/
+/src/index.jsx
+/.build/
+
+# compiled BPF objects + generated CO-RE header. bin/sandbox-watch is the
+# launch/attach wrapper (source, not a build artifact), so it is kept.
+/bin/*
+!/bin/.gitkeep
+!/bin/sandbox-watch
+/src/bpf/include/vmlinux.h
+
+# kernel-matrix run output (build/kernel-matrix.sh)
+/.kmatrix/
