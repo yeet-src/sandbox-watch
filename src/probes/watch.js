@@ -1,0 +1,174 @@
+// The exec + file-open streams as reactive signals. Seeds the traced set,
+// subscribes to the two ring buffers once, feeds the pure aggregation in
+// lib/model.js, and exposes what the UI reads. The only BPF-aware module
+// besides probe.js.
+import { signal } from "yeet:tui";
+import { ArrayMap, DataSec, HashMap, RingBuf } from "yeet:bpf";
+import { control } from "./probe.js";
+import { normalize, normalizeOpen } from "../lib/argv.js";
+import { createModel, foldKey } from "../lib/model.js";
+
+const events = new RingBuf(control, "events");
+const opens = new RingBuf(control, "opens");
+const traced = new HashMap(control, "traced");
+const bss = new DataSec(control, "probe.bss");
+const statsMap = new ArrayMap(control, "stats_map");
+
+// How many execs the kernel emitted vs dropped. A drop means the ring buffer
+// filled faster than userspace drained it, so the numbers on screen are a
+// floor rather than a count. Polled rather than streamed: it only needs to be
+// right when it is read.
+// A SIGNAL, not a plain variable. A thunk only re-renders when a signal it read
+// changes, so a plain function returning a mutated local would be computed
+// correctly and never drawn.
+export const droppedCount = signal(0);
+export const dropped = () => droppedCount.get();
+
+// The net namespace of the watched agent (Claude Code), learned in-kernel at its
+// first fork. 0 until learned; and 0 is also the honest answer for a scope that
+// is not a single agent (whole-host, a container). The verdict turns on only
+// once this is non-zero AND at least one exec has run in a different namespace.
+// See probes' host_netns comment for why the kernel learns it rather than being
+// told.
+export const hostNetns = signal(0);
+export const hostNetnsValue = () => hostNetns.get();
+
+// Pass the agent netns in as a thunk so the model can tag each exec
+// sandboxed/host. It reads live, so execs captured before the netns was learned
+// get classified correctly on the next projection.
+const model = createModel({ hostNetns: () => hostNetns.get() });
+
+// A fold flashes for a moment after it fires, so an exec that lived 3ms is
+// still visible on screen. Map of foldKey -> expiry ms.
+export const flashes = new Map();
+const FLASH_MS = 700;
+
+export const status = signal("starting");
+export const paused = signal(false);
+// Mirror of `paused` as a plain boolean. The ring-buffer callback must NOT read
+// a signal: it fires outside the reactive graph, and a signal read there is
+// both meaningless and (with a render in flight) a guard violation that gets
+// swallowed by the subscription; every event silently dropped, no error
+// anywhere. main.jsx flips this through setPaused().
+let pausedFlag = false;
+export const setPaused = (v) => { pausedFlag = v; paused.set(v); };
+
+// Poll the learned agent netns out of .bss until it lands, then stop. It is
+// written once in-kernel at the agent's first fork, so a short poll is enough;
+// reading it in the ring-buffer callback would be a signal read off the
+// reactive path (gotcha: that silently kills the stream).
+let netnsSettled = false;
+setInterval(async () => {
+  if (netnsSettled) return;
+  try {
+    const v = Number((await bss.read("host_netns")) ?? 0);
+    if (v && v !== hostNetns.get()) { hostNetns.set(v); netnsSettled = true; }
+  } catch { /* advisory; the UI degrades to the exec feed without a verdict */ }
+}, 500);
+
+// Seed the traced set with the agent pid at depth 0. Everything below it is
+// added in-kernel at fork, so this is the only write JS makes.
+export async function seedRoot(pid, comm) {
+  await traced.update({ tgid: pid }, { depth: 0 });
+  // Name the agent in the model too, so its direct children show a parent name
+  // instead of "?". The kernel only tells us a ppid; the comm for a process we
+  // never saw exec has to come from here.
+  model.seed(pid, comm ?? String(pid));
+}
+
+// Seed processes that ALREADY exist, so a scope isn't limited to what forks
+// after we attach. Rows are {pid, comm, depth} from lib/scope.js. Membership
+// spreads forward from each of them exactly as it does from the agent root.
+export async function seedExisting(rows) {
+  let n = 0;
+  for (const r of rows) {
+    try {
+      await traced.update({ tgid: r.pid }, { depth: r.depth });
+      if (r.comm) model.seed(r.pid, r.comm);
+      n++;
+    } catch {
+      // The map is capacity-bounded; a full map should cost us this one process
+      // rather than the whole seed, so keep going and report what landed.
+    }
+  }
+  return n;
+}
+
+// One subscription per stream, driving one model.
+//
+// The subscriptions are started EAGERLY here rather than inside `from()`. A
+// from() producer doesn't run until something watches it: with the ring buffer
+// opened lazily, the stream never turns on if the first read happens outside a
+// reactive context, and the whole screen sits empty forever.
+//
+// `tick` is a plain signal that bumps on each coalesced batch. Components read
+// it inside a thunk, which is what makes them re-render.
+export const tick = signal(0);
+
+// When the last exec arrived, and when we attached. Silence is a real reading
+// here, not a missing one: an idle agent execs nothing, so "nothing for a while"
+// is the honest answer, and it is worth SAYING rather than leaving a "waiting…"
+// that reads like a broken probe.
+let attachedAt = Date.now();
+let lastExecAt = 0;
+export const idle = () => ({
+  sinceAttach: (Date.now() - attachedAt) / 1000,
+  sinceExec: lastExecAt ? (Date.now() - lastExecAt) / 1000 : null,
+});
+
+let dirty = false;
+let beats = 0;
+// AWAITED: RingBuf.subscribe() returns a Promise and does not attach until it
+// resolves. Fire-and-forget leaves the ring buffer unattached, the model empty,
+// and the UI frozen on its first frame with no error anywhere. This module is
+// imported from main.jsx, which is top-level-await, so awaiting here is safe.
+await events.subscribe((w) => {
+  if (pausedFlag) return;
+  const e = normalize(w);
+  model.add(e);
+  lastExecAt = Date.now();
+  flashes.set(foldKey(e), Date.now() + FLASH_MS);
+  dirty = true;
+});
+
+// File opens feed the same model as a side channel: the exec stream says a
+// command references a credential path, the open stream says whether its read
+// landed on the real file or the sandbox's stand-in. The model joins them by
+// pid. Credential-shaped opens are rare, so this never approaches the exec rate.
+await opens.subscribe((w) => {
+  if (pausedFlag) return;
+  model.addOpen(normalizeOpen(w));
+  dirty = true;
+});
+
+// Poll the kernel counters once a second. Cheap, and only used to warn.
+setInterval(async () => {
+  try {
+    const c = await statsMap.lookup(0);
+    const n = Number(c?.dropped ?? 0);
+    if (n !== droppedCount.get()) droppedCount.set(n);
+  } catch { /* counters are advisory; never break the UI over them */ }
+}, 1000);
+
+// Coalesce: a burst of execs between frames would spend the render budget on
+// work the eye cannot see. The flash decay also needs a heartbeat, so tick
+// advances even when the stream is briefly quiet but flashes are still fading.
+setInterval(() => {
+  const fading = flashes.size > 0;
+  // Tick at least once a second even with nothing arriving, so the idle line
+  // counts up instead of freezing at whatever it said when the stream stopped.
+  const heartbeat = ++beats % 10 === 0;
+  if (dirty || fading || heartbeat) {
+    dirty = false;
+    const now = Date.now();
+    for (const [k, exp] of flashes) if (exp < now) flashes.delete(k);
+    tick.update((v) => v + 1);
+  }
+}, 100);
+
+// Projections. Each reads `tick` so it recomputes when the stream advances.
+export const stats = () => ({ total: model.total, elapsed: model.elapsed });
+export const folds = () => model.folds();
+export const verdicts = () => model.verdicts();
+export const attempts = () => model.attempts();
+export const sandboxDetected = () => model.sandboxDetected();
